@@ -1,0 +1,767 @@
+-- TurtlePrint Depot
+-- last edited 2022 january 24
+
+-- USAGE:
+-- tpd [image path] x z
+
+tArgs = {...}
+
+CHUNKHEIGHT = 8;
+CHUNKWIDTH	= 8;
+
+LANDMARKS = {
+	parking = {
+		x = 517, y = 57, z = -1404
+	},
+	fuel = {
+		x = 514, z = -1403
+	},
+	["0"] = {
+		x = 513, z = -1402
+	},
+	b = {
+		x = 512, z = -1401
+	},
+	f = {
+		x = 511, z = -1400
+	},
+	ret = {
+		x = 515, z = -1404
+	}
+}
+
+-- indexed by their id
+turtles = {
+	-- -- placeholder turtle for now at id 1 
+	-- [1] = {
+		-- actionindex = 1,
+		-- -- 0 is east, 1 is north, 2 west, 3 south
+		-- facing = 1,
+		-- fuel = 100,
+		-- pos = { x = LANDMARKS.parking.x, z = LANDMARKS.parking.z },
+		-- parked = true,
+		-- taskindex = nil,
+		-- woolcount = 0
+	-- }
+}
+
+-- list with id numbers
+collisionreports = {
+
+}
+
+-- each task is structured like:
+-- 	{
+--		assigned = false,
+--		color = "b",
+--		completed = false,
+--		index = 1,
+--		actions = { 				-- a list
+--			{
+--				x = 170, z = -860
+--			},
+--			{
+--				x = 171, z = -860
+--			}
+--		}
+-- 	}
+tasks = {};
+
+-- top left corner of the image being drawn
+IMAGE_ORIGINX = tArgs[2]
+IMAGE_ORIGINZ = tArgs[3]
+
+IMAGEDONEFLAG = false;
+doneturtles = {}; 		-- keys: turtle id, vals: boolean
+lastcompletetime = {}; 	-- keys: ditto, vals: number in seconds
+
+function main()
+	rednet.open("top");
+	rednet.host("turtleprint", "tpdepot")
+	
+	-- image load
+	image = {};
+	for line in io.lines(tArgs[1]) do
+		table.insert(image, line);
+	end
+	width = #image[1];
+	height = #image;
+	print("width: " .. width .. " height: " .. height)
+	
+	splitImageIntoTasks(image);
+	--splitTaskIntoActions(tasks[1], 1);
+	
+	-- local ts = textutils.serialize( tasks[1] )
+	-- local file = io.open("tasks", "w");
+	-- file:write(ts)
+	-- file:close()
+	
+	while true do
+		local id, message, protocol	= rednet.receive();
+		if protocol == "tp_requestpos" then
+			local location = { 
+				x = LANDMARKS.parking.x + message , 
+				y = LANDMARKS.parking.y, 
+				z = LANDMARKS.parking.z + message
+			}
+			rednet.send(id, location,  "tp_pos");
+			rednet.send(id, LANDMARKS, "tp_landmarks");
+		end
+		if protocol == "tp_requestaction" then
+			local currstatus = message;
+			turtles[id] = currstatus;
+			
+			-- before anything lets just unset hopflag if its still set from the previous move
+			local ft = getFacingTurtles( id, currstatus.pos.x, currstatus.pos.z, currstatus.facing );
+			if #ft == 0 then currstatus.hopflag = false; end
+			
+			-- first, we must figure out if this turtle needs a new task,
+			-- or if it's continuing working on an already assigned task
+			local needsnewtask = false;
+			if not currstatus.taskindex then needsnewtask = true;
+			else
+				local ct = tasks[currstatus.taskindex];
+				if not ct then needsnewtask = true;
+				else
+					if ct.completed then needsnewtask = true; end
+				end
+			end
+			local NOTASKSFLAG = false;
+			local task;
+			if needsnewtask then
+				currstatus.actionindex = 0; -- it'll become 1 shortly
+				task = assignTask(currstatus)
+				
+				-- turtle needs a task, but no tasks are available.
+				if (not task) then
+					if (not currstatus.parked) then
+						-- generates a final task that parks the turtle back at the depot
+						-- and faces it forward
+						task = {
+							color = currstatus.assignedcolor,
+							index = #tasks + 1,
+							items = {
+								{
+									actionoverride = "face",
+									argoverride = 1,
+									x = LANDMARKS.parking.x + currstatus.spot,
+									z = LANDMARKS.parking.z + currstatus.spot
+								},
+								{
+									actionoverride = "down",
+									x = LANDMARKS.parking.x + currstatus.spot,
+									z = LANDMARKS.parking.z + currstatus.spot
+								}
+							}
+						}
+						table.insert(tasks, task)
+					else
+						NOTASKSFLAG = true; --print("NOTASKSFLAG set")
+						
+						-- once we start sending nil tasks to turtles ("nothing more to assign to you"),
+						-- we know we are nearly at the end. check to see how many more tasks are uncompleted
+						-- if all is finished, then we begin giving turtles permission to disconnect
+						-- (the command "tp_imagecomplete")
+						if (not task) then
+							local alltasksdone = true
+							for i = 1, #tasks do
+								if not tasks[i].completed then
+									alltasksdone = false; break;
+								end
+							end
+							
+							if alltasksdone then
+								IMAGEDONEFLAG = true;
+								print("sending imagecomplete to " .. id);
+								rednet.send(id, "",  "tp_imagecomplete");
+								doneturtles[id] = true;
+								
+								-- if every turtle has disconnected, then we are truly done with this program
+								local allturtlesdone = true
+								for k,v in pairs(turtles) do
+									if not doneturtles[k] then allturtlesdone = false; break; end
+								end
+								
+								if allturtlesdone then
+									print("Image completed! ending program...");
+									rednet.close("top");
+									return
+								end
+							end
+						end
+					end
+				end
+				
+				-- newly made tasks must be prepared, split into its respective actions, and assigned
+				if (task) then
+					prepareTask(task, currstatus)
+					splitTaskIntoActions(tasks[task.index], id);
+					-- assign color to the turtle
+					currstatus.assignedcolor = task.color;
+					currstatus.taskindex = task.index;
+					tasks[task.index].assigned = true;
+				end
+			else
+				task = tasks[currstatus.taskindex];
+			end
+						
+			local act; local nextact;
+			if not NOTASKSFLAG then
+				-- if for whatever reason the turtle is parked, insert an up command immediately.
+				-- all other following commands rely on the turtle being out of park mode
+				if currstatus.parked then
+					local a = {
+						acttype = "up",
+						x		= currstatus.pos.x,
+						z		= currstatus.pos.z
+					}
+					table.insert(task.actions, currstatus.actionindex + 1, a)
+					currstatus.parked = false;
+				end
+				act 	= task.actions[currstatus.actionindex + 1];
+				nextact = task.actions[currstatus.actionindex + 2];
+				
+				-- COLLISION PREVENTION/RESOLUTION
+				local xtable = { 1, 0, -1, 0 }; local ztable = { 0, -1, 0, 1 }
+				
+				-- the first step of collision prevention is to prevent turtles from entering into
+				-- a position where they would be colinear and facing each other
+				if act.acttype == "forward" then
+					-- where the turtle will be following one forward move
+					-- (I HAVE TO ADD 1 TO FACING BECAUSE OF LUA INDICES ARGH)
+					local tx = currstatus.pos.x + xtable[currstatus.facing + 1]; 
+					local tz = currstatus.pos.z + ztable[currstatus.facing + 1];
+					
+					if nextact then
+						-- if we pass through the row or column and are planning to immediately go forward again,
+						-- then the problem of facing is avoided
+						if nextact.acttype == "forward" then
+							-- do nothing
+							
+						-- turtle will turn next: prevent passage into the col/row if planning to face any
+						-- turts, otherwise pasage into the col/row is fine
+						elseif nextact.acttype == "face" then
+							local factur = getFacingTurtles( id, tx, tz, nextact.arg );
+							if #factur > 0 then act = nil 
+							print(id .. " plans to turn and will be facing another turt")
+							end
+							
+						-- any other next action: dont have to wait, it's probably fine
+						else
+							--local coltur = getColinearTurtles( id, tx, tz );
+							--if #coltur > 0 then act = nil end
+						end
+					-- if the next action is unknown, then wait for turts to leave the col/row before proceeding
+					else
+						local coltur = getColinearTurtles( id, tx, tz );
+						if #coltur > 0 then act = nil 
+							print(id .. " has unknown plans, waiting")
+						end
+					end
+					
+					-- Regardless of what the turtle's next act is, we still need to check that
+					-- if turt are somehow facing other turt, to hop out of the way as a last resort only
+					local factur = getFacingTurtles( id, currstatus.pos.x, currstatus.pos.z, currstatus.facing );
+					local nonehopping = true;
+					for i = 1, #factur do
+						if turtles[ factur[i] ].hopflag then nonehopping = false; break; end
+					end
+					if #factur > 0 and nonehopping then currstatus.hopflag = true; 
+						print(id .. " is going forward & facing another turt, hopping")
+					end
+				
+				-- if we have inadvertently gotten into a column/row with other turtles 
+				-- (which is bound to happen) then its too late to prevent facing the turts
+				-- stopping the facing action is pointless since turt's already sitting in the
+				-- middle of the lane where the other turts are.
+				-- so just set the hopflag high so the turtle jumps up
+				elseif act.acttype == "face" then
+					local factur = getFacingTurtles( id, currstatus.pos.x, currstatus.pos.z, act.arg );
+					
+					-- if any opposite-facing turtle is already hopping, DON'T HOP
+					-- otherwise both turts will get stuck in permanently hopped position waiting for the other
+					local nonehopping = true;
+					for i = 1, #factur do
+						if turtles[ factur[i] ].hopflag then nonehopping = false; break; end
+					end
+					if #factur > 0 and nonehopping then currstatus.hopflag = true; 
+						print(id .. " is turning to face another turt, hopping")
+					end
+				end
+				-- END COLLISION PREVENTION/RESOLUTION
+				
+				-- turtle must wait till it's landed from hopping before it places down blocks
+				-- also any vertical movement commands could have severe side effects
+				if act then
+					if currstatus.hopflag and 
+					(	act.acttype == "placeDown" or act.acttype == "up" 
+					or	act.acttype == "down") then
+						act = nil;
+						print(id .. " is waiting to place");
+					end
+				end
+			end
+			currstatus.action = act;
+			
+			-- action counter is stepped only if there is an action to execute on this step
+			if currstatus.action then 
+				currstatus.actionindex = currstatus.actionindex + 1;
+			end
+			-- the whole status is sent back over to the turtle, to avoid any desyncing problems
+			rednet.send(id, currstatus,  "tp_action");
+		end
+		
+		if protocol == "tp_actioncomplete" then
+			-- TODO assert valid x and z position
+			local currstatus = message;
+			turtles[id] = currstatus;
+			
+			local currtask = tasks[currstatus.taskindex];
+			if currstatus.actionindex >= #currtask.actions then
+				currtask.completed = true;
+			end
+		end
+		
+		-- TODO check the time elapsed of all turtles since their last message
+		-- if its more than (idk 10 seconds?) then consider them MIA and de-assign their tasks
+		-- so another turtle can take over
+	end
+end
+
+-- returns a task object ready to be sent over
+function assignTask( turtlestatus )
+	-- first, the unassigned tasks must be separated from the assigned ones
+	-- (NOTE: this is a deliberately shallow copy)
+	local unassigned_tasks = {};
+	for i = 1, #tasks do
+		local ct = tasks[i] -- current task
+		if not ct.assigned then
+			table.insert(unassigned_tasks, ct)
+		end
+	end
+	
+	-- if no unassigned tasks exist, then that means all tasks have turtles working on them already,
+	-- or the image is done rendering completely. so just return false
+	if (#unassigned_tasks == 0) then
+		return false;
+	end
+	
+	-- list of other turtles actively printing (will be used in a bit)
+	local otherturtles = {}
+	for k, v in pairs( turtles ) do
+		if v ~= turtlestatus and (not v.parked) then table.insert(otherturtles, v) end
+	end
+	
+	-- make a list of unassigned tasks which match the assigned color of the turtle in question
+	local matchingtasks = {}
+	for i = 1, #unassigned_tasks do
+		local ct = unassigned_tasks[i]
+		if (not ct.assigned) and ( ct.color == turtlestatus.assignedcolor ) then
+			table.insert(matchingtasks, ct);
+		end
+	end
+	-- no other turtles to worry about where they are? just assign a random task
+	if (#otherturtles == 0) then
+		local taskindex = math.random(1, #unassigned_tasks);
+		return unassigned_tasks[taskindex];
+	end
+	-- no tasks match the turtle's current assigned color? then any color is available
+	if (#matchingtasks == 0) then
+		matchingtasks = unassigned_tasks;
+	end
+	
+	-- now iterate through all the matching tasks... for each task, get its first command
+	-- then iterate through all the turtles' current tasks, and calculate the distance to those first commands
+	-- average those distances and pick the largest dist
+	-- this keeps the turtles as far away from each other as possible, ideally
+	local highestavgdist = 0;
+	local besttask = nil;
+	
+	for i = 1, #matchingtasks do
+		local currenttask = matchingtasks[i];
+		local ctx = currenttask.items[1].x; local ctz = currenttask.items[1].z;
+		
+		local avgdist = 0;
+		for q = 1, #otherturtles do
+			local otherturttask = tasks [ otherturtles[q].taskindex ];
+			local otx = otherturttask.items[1].x; local otz = otherturttask.items[1].z;
+			
+			local currdist = distance( ctx, ctz, otx, otz );
+			avgdist = avgdist + currdist;
+		end
+		avgdist = avgdist / #otherturtles;
+		--print( currenttask.index .. ": avg dist: " .. avgdist );
+		
+		if avgdist > highestavgdist then
+			highestavgdist = avgdist; besttask = currenttask;
+		end
+	end
+	if (not besttask) then print("ERROR! no task was selected"); end
+	
+	return besttask;
+end
+
+-- void function, operates directly on the task object provided
+-- this has to be called after the task has already been assigned, because
+-- it relies on the assigned turtle's status to generate all the actions
+function splitTaskIntoActions(task, turtleid)
+	task.actions = {};
+	-- we trace the turtles position over the course of the whole task 
+	-- with a temporary turtle status obj, simulating hypothetically where the turtle will be at
+	local turt = turtles[turtleid];
+	local hypturt = makeHypotheticalTurtle(turt);
+	
+	for i = 1, #task.items do
+		local ci = task.items[i] -- current item
+		addActionsGotoPos(task.actions, hypturt, ci.x, ci.z);
+		
+		-- the default action for an item is to place down a block, but this can be overridden
+		-- TODO clean this up
+		if ci.actionoverride == "down" then
+			addActionWithType(task.actions, hypturt, "down");
+		elseif ci.actionoverride == "refuelUp" then
+			addActionsRefuel(task.actions, hypturt)
+		elseif ci.actionoverride == "restockUp" then
+			addActionWithType(task.actions, hypturt, "restockUp");
+		elseif ci.actionoverride == "returnFuel" then
+			addActionWithType(task.actions, hypturt, "returnFuel");
+		elseif ci.actionoverride == "returnWool" then
+			addActionWithType(task.actions, hypturt, "returnWool");
+		elseif ci.actionoverride == "face" then
+			addActionWithType(task.actions, hypturt, "face", ci.argoverride);
+		else
+			addActionPlaceDown(task.actions, hypturt);
+		end
+	end
+end
+
+-- void function, operates directly on the task object and status provided
+function prepareTask(task, currstatus)
+	-- before starting the new task, let us ensure that the turtle has enough
+	-- fuel and wool to complete the task and get back to the depot.
+	local tasktotalfuelcost = 0;
+	local tasktotalwoolcost = 0;
+	local cx = currstatus.pos.x; local cz = currstatus.pos.z;
+	for q = 1, #task.items do
+		local item = task.items[q];
+		local dist = distance(cx, cz, item.x, item.z);
+		tasktotalfuelcost = tasktotalfuelcost + dist;
+		
+		-- the default action for items is to place wool down
+		if not item.actionoverride then
+			tasktotalwoolcost = tasktotalwoolcost + 1;
+		end
+	end
+	-- (where the last item ends off, the distance from there to the fuel station at the depot)
+	local disttostation = distance(cx, cz, LANDMARKS.fuel.x, LANDMARKS.fuel.z);
+	tasktotalfuelcost = tasktotalfuelcost + disttostation;
+	
+	-- ( the following items will now be inserted in reverse order )
+	local cushion  = 100;
+	-- If not enough wool then go straight to the wool chest
+	--print("wool cost:	 " .. tasktotalwoolcost);
+	--print("turtle wool:	 " .. currstatus.woolcount);
+	local needsrestock = false;
+	if tasktotalwoolcost + cushion > currstatus.woolcount then needsrestock = true end
+	if task.color ~= currstatus.assignedcolor then needsrestock = true end
+	
+	if needsrestock then
+		--print("Adding wool stop")
+		local newitem = {
+			actionoverride = "restockUp",
+			x = LANDMARKS[task.color].x,
+			z = LANDMARKS[task.color].z
+		}
+		table.insert( task.items, 1, newitem );
+	end
+	
+	-- if wool color is different, then dump the current wool in the return chest
+	if task.color ~= currstatus.assignedcolor then
+		local newitem = {
+			actionoverride = "returnWool",
+			x = LANDMARKS.ret.x,
+			z = LANDMARKS.ret.z
+		}
+		table.insert( task.items, 1, newitem );
+	end
+	
+	-- If the distance to get to the fuel place + the target square is more than what fuel is left
+	-- then go immediately to get fuel at the start of the task
+	--print("fuel cost:	 " .. tasktotalfuelcost);
+	--print("turtle fuel:	 " .. currstatus.fuel);
+	if tasktotalfuelcost + cushion > currstatus.fuel then
+		--print("Not enough fuel, adding fuel stop")
+		
+		local returnitem = {
+			actionoverride = "returnFuel",
+			x = LANDMARKS.ret.x,
+			z = LANDMARKS.ret.z
+		}
+		table.insert( task.items, 1, returnitem );
+		local refuelitem = {
+			actionoverride = "refuelUp",
+			x = LANDMARKS.fuel.x,
+			z = LANDMARKS.fuel.z
+		}
+		table.insert( task.items, 1, refuelitem );
+	end
+end
+
+function addActionsGotoPos(actions, turt, x, z)
+	-- if not ( x == LANDMARKS.fuel.x and z == LANDMARKS.fuel.z ) then
+		-- -- If the distance to get to the fuel place + the target square is more than what fuel is left
+		-- -- then go immediately to get fuel before even trying to go to the target square
+		
+		-- local targdist = distance(x,z,turt.pos.x,turt.pos.z);
+		-- local targtofueldist = distance(LANDMARKS.fuel.x, LANDMARKS.fuel.z,x,z);
+		-- -- plus 20 extra blocks just in case
+		-- local cushion  = 20;
+		-- if targdist + targtofueldist + cushion > turt.fuel then
+			
+			-- print("adding a fuel stop to task");
+			-- addActionsGotoPos( actions, turt, LANDMARKS.fuel.x, LANDMARKS.fuel.z );
+			-- addActionsRefuel( actions, turt ) 
+		-- end
+	-- end
+	-- ONLY if z position differs
+	if z ~= turt.pos.z then
+		local step;
+		if z > turt.pos.z then
+			addActionFace( actions, turt, 3 )
+			step = 1;
+		elseif z < turt.pos.z then
+			addActionFace( actions, turt, 1 )
+			step = -1;
+		end
+		local zdiff = math.abs(z - turt.pos.z);
+		for i = 1, zdiff do			
+			turt.pos.z = turt.pos.z + step;
+			addActionForward( actions, turt )
+		end
+	end
+	-- ONLY if x position differs
+	if x ~= turt.pos.x then
+		local step;
+		if x > turt.pos.x then
+			addActionFace( actions, turt, 0 )
+			step = 1;
+		elseif x < turt.pos.x then
+			addActionFace( actions, turt, 2 )
+			step = -1;
+		end
+		local xdiff = math.abs(x - turt.pos.x);
+		for i = 1, xdiff do	
+			turt.pos.x = turt.pos.x + step;
+			addActionForward( actions, turt )
+		end
+	end
+end
+
+function addActionForward( actions, turt )
+	local a = {
+		acttype = "forward",
+		x		= turt.pos.x,
+		z		= turt.pos.z
+	}
+	table.insert(actions, a)
+	-- TODO maybe add the turt pos updates here (its done in the addActionsGotoPos for now)
+end
+
+function addActionPlaceDown( actions, turt )
+	local a = {
+		acttype = "placeDown",
+		arg		= argin,
+		x		= turt.pos.x,
+		z		= turt.pos.z
+	}
+	table.insert(actions, a)
+	turt.woolcount = turt.woolcount - 1;
+end
+
+function addActionFace( actions, turt, argin )
+	local a = {
+		acttype = "face",
+		arg		= argin,
+		x		= turt.pos.x,
+		z		= turt.pos.z
+	}
+	table.insert(actions, a)
+	turt.facing = argin;
+end
+
+function addActionsRefuel(actions, turt)
+	local a = {
+		acttype = "refuelUp",
+		x		= turt.pos.x,
+		z		= turt.pos.z
+	}
+	table.insert(actions, a)
+	turt.fuel = 100000;
+	
+	-- TODO
+	-- excess coal in the sixteenth slot goes to the separate return chest that recirculates it back into the ME
+	--goToLandmark( "ret" );
+	--turtle.dropUp();
+end
+
+function addActionWithType(actions, turt, typ, argin)
+	local a = {
+		acttype = typ,
+		x		= turt.pos.x,
+		z		= turt.pos.z
+	}
+	if argin then a.arg = argin end 
+	table.insert(actions, a)
+end
+
+-- void function, clears the tasks table and fills it with new tasks
+function splitImageIntoTasks(image)
+	-- image is splitted into smaller (16x16) sub images called chunks
+	local chunkcountx = math.ceil( width  / CHUNKWIDTH );
+	local chunkcounty = math.ceil( height / CHUNKHEIGHT );
+	local chunks = {};
+	for cy = 0, chunkcounty - 1 do
+		for cx = 0, chunkcountx - 1 do
+		
+			local startx = (CHUNKWIDTH  * cx) + 1;
+			local starty = (CHUNKHEIGHT * cy) + 1;
+			local currentchunk = {};
+		
+			for y = starty, starty + CHUNKHEIGHT - 1 do
+				local concatline;
+				if not image[y] then
+					concatline = string.rep(" ", CHUNKWIDTH)
+				else
+					concatline = string.sub(image[y], startx, startx + CHUNKWIDTH - 1);
+					local cll = #concatline
+					concatline = concatline .. string.rep(" ", CHUNKWIDTH - cll);
+				end
+				table.insert(currentchunk, concatline);
+			end
+			
+			table.insert(chunks, currentchunk);
+		end
+	end
+	
+	-- separating the colors of each chunk into their own tasks
+	tasks = {};
+	totaltaskindex = 1; -- a count of all tasks across all chunks
+	
+	for i = 1, #chunks do
+		local currentchunk = chunks[i];
+		-- only the tasks present in this chunk, which will be added to the main task list at the end
+		local currentchunktasks = {};
+		
+		for py = 1, #currentchunk do
+			local currentline = currentchunk[py];
+			local chunkx = ((i - 1) % chunkcountx)
+			local chunky = math.floor((i - 1) / chunkcountx)
+			
+			-- the order of tasks in every other line is horizontally flipped
+			-- this recreates the boustrophedon (back and forth) motion that is twice as fast as raster scanning
+			local startcol; local endcol; local step;
+			if (py - 1) % 2 == 0 then
+				startcol = 1; endcol = #currentline; step = 1;
+			else
+				startcol = #currentline; endcol = 1; step = -1;
+			end
+			
+			for px = startcol, endcol, step do
+				local currentchar = string.sub(currentline, px, px)
+				-- transparent pixels are ignored
+				if currentchar ~= " " then
+				
+					-- the current chunk's tasks are indexed with a key of their color name
+					-- this way the pixels are sorted into their respective colors
+					if not currentchunktasks[ currentchar ] then
+						currentchunktasks [ currentchar ] = { color = currentchar, items = {} }
+					end
+				
+					local newtaskitem = {
+						x = IMAGE_ORIGINX + (CHUNKWIDTH  * chunkx) + (px - 1),
+						z = IMAGE_ORIGINZ + (CHUNKHEIGHT * chunky) + (py - 1)
+					}
+					table.insert(currentchunktasks[ currentchar ].items, newtaskitem)
+				end
+			end
+		end
+		
+		-- now that this chunk's tasks are written, we can add these tasks to the main tasks list
+		-- here is also where I add tracking to each task
+		for k, v in pairs(currentchunktasks) do
+			v.assigned = false; v.completed = false; v.index = totaltaskindex;
+			table.insert(tasks, v);
+			totaltaskindex = totaltaskindex + 1
+		end
+	end
+	
+	return
+end
+
+-- deep copy of turtle for doing calculations on
+function makeHypotheticalTurtle(turt)
+	local hypotheticalturt = {
+		facing 	= 	turt.facing,
+		fuel	= 	turt.fuel,
+		parked	= 	turt.parked,
+		pos 	= { 
+			x = turt.pos.x, z = turt.pos.z
+		},
+		woolcount = turt.woolcount
+	}
+	return hypotheticalturt;
+end
+
+function getTurtleFromSpot(spot)
+	
+end
+
+-- returns a table with the id's of all turtles colinear to a given position
+function getColinearTurtles(id, tx, tz)
+	local turts = {}
+	for k,v in pairs(turtles) do
+		local cx = v.pos.x; local cz = v.pos.z;
+		if (cx == tx or cz == tz) and k ~= id and (not v.parked) then
+			table.insert(turts, k);
+		end
+	end
+	return turts;
+end
+function getFacingTurtles(id, tx, tz, tfacing)
+	local turts = {}
+	local colinearturts = getColinearTurtles( id, tx, tz);
+	for i = 1, #colinearturts do
+		local ct = turtles [ colinearturts[i] ];
+		local facing = areTurtlesFacing( 
+			tx, tz, tfacing,
+			ct.pos.x, ct.pos.z, ct.facing
+		)
+		if facing then
+			print(id .. " is facing " .. colinearturts[i]);
+			table.insert(turts, colinearturts[i]);
+		end
+	end
+	return turts;
+end
+
+function areTurtlesFacing(x1, z1, dir1, x2, z2, dir2)
+	if dir1 == 0 then
+		return (x2 > x1) and (z1 == z2) and (dir2 == 2)
+	end
+	if dir1 == 1 then
+		return (x2 == x1) and (z1 > z2) and (dir2 == 3)
+	end
+	if dir1 == 2 then
+		return (x2 < x1) and (z1 == z2) and (dir2 == 0)
+	end
+	if dir1 == 3 then
+		return (x2 == x1) and (z1 < z2) and (dir2 == 1)
+	end
+end
+
+-- manhattan distance between two blocks at the same y level
+function distance(x1,z1,x2,z2)
+	return math.abs( x1 - x2 ) + math.abs( z1 - z2 );
+end
+
+main()

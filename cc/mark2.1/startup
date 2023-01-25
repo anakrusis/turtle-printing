@@ -1,0 +1,338 @@
+-- TurtlePrint
+-- last edited 2023 january 24
+
+status = {
+	action = nil,
+	-- indexes into the current task's action table
+	actionindex = nil,
+	assignedcolor = nil,
+	-- 0 is east, 1 is north, 2 west, 3 south
+	facing = 1,
+	fuel = 0,
+	-- flag to tell it to hop up and wait for another turtle to pass underneath
+	hopflag = false,
+	parked = true,
+	pos = { x = 193, y = 56, z = -887 },
+	spot = nil,
+	-- indexes into the server's task table
+	taskindex = nil,
+	woolcount = 0,
+}
+
+tpdepotid = nil;
+
+function main()
+	-- cant leave the depot without a little kickstart, won't even bother connecting without that
+	if turtle.getFuelLevel() < 50 then
+		print("Not enough fuel to init, exiting...")
+		return
+	end
+	-- initial connection
+	rednet.open("right");
+	print("Waiting for connection to server...");
+	while not tpdepotid do
+		tpdepotid = rednet.lookup("turtleprint","tpdepot")
+		os.sleep(1);
+	end
+	print("Connected!")
+
+	-- we request an absolute position given our parking spot
+	print("What parking spot am I in?")
+	local spot = io.read();
+	spot = tonumber(spot);
+	if not spot then
+		print("Invalid spot number!"); return
+	end
+	status.spot = math.floor(spot);
+	rednet.send(tpdepotid, spot, "tp_requestpos");
+	
+	-- immediately expects two responses: where it is and where all the important landmarks are
+	local id, message, protocol = rednet.receive("tp_pos");
+	status.pos = message;
+	print("I am located at x: " .. status.pos.x .. " y: " .. status.pos.y .. " z: " .. status.pos.z);
+	local id, message, protocol = rednet.receive("tp_landmarks");
+	LANDMARKS = message;
+	
+	while true do
+		-- update information
+		status.fuel = turtle.getFuelLevel();
+	
+		-- turtle is ready to start receiving commands
+		rednet.send(tpdepotid, status, "tp_requestaction");
+		local id, message, protocol = rednet.receive();
+		if protocol == "tp_action" then
+			if message.taskindex ~= status.taskindex then
+				print("New task: " .. message.taskindex)
+			end
+			-- a special command set high or low depending on collision resolution stuff
+			if message.hopflag ~= status.hopflag then
+				if message.hopflag then up() else down() end
+			end
+			
+			status = message; local ca = status.action -- current action
+			
+			if not ca then
+				os.sleep(2)
+				-- same thing as os.sleep() but doesnt stop receiving events
+				--local starttime = os.clock();
+				--while os.clock() < starttime + 2 do
+				--end
+			else
+				-- the commands are decoded here... gosh I wish lua had switch statements
+				local catype = ca.acttype;
+				print(catype);
+				if catype == "down" then
+					down();
+					status.parked = true;
+				end
+				if catype == "face" then
+					face( ca.arg );
+				end
+				if catype == "forward" then
+					forward()
+				end
+				if catype == "placeDown" then
+					placeDown()
+				end
+				if catype == "refuelUp" then
+					refuel()
+				end
+				if catype == "restockUp" then
+					restockWool();
+				end
+				if catype == "returnFuel" then
+					turtle.select(16);
+					turtle.dropDown();
+				end
+				if catype == "returnWool" then
+					for i = 1, 15 do
+						turtle.select(i); turtle.dropDown();
+					end
+				end
+				if catype == "up" then
+					up();
+					status.parked = false;
+				end
+				
+				-- let the server know the action is done so it can assert the validity on its end
+				rednet.send(tpdepotid, status, "tp_actioncomplete");
+			end
+		end
+		if protocol == "tp_imagecomplete" then 
+			status.actionindex = nil; status.action = nil;
+			status.taskindex = nil;
+			waitForReconnect();
+		end
+	end
+end
+
+-- after the tpd program stops and all drawing has finished, the server closes its modem
+-- now we will wait for a new program to start
+function waitForReconnect()
+	if rednet.lookup("turtleprint","tpdepot") then
+		print("waiting for disconnect...");
+		while rednet.lookup("turtleprint","tpdepot") do
+			os.sleep(2)
+		end
+	end
+	print("waiting for reconnect...");
+	while not rednet.lookup("turtleprint","tpdepot") do
+		os.sleep(2)
+	end
+	print("reconnected!")
+end
+
+function placeDown()
+	local itemfound = false;
+	for i = 1, 15 do
+		if turtle.getItemCount( i ) > 0 then
+			turtle.select( i ); itemfound = true; break;
+		end	
+	end
+	if not itemfound then print("Not enough wool! wtf? ending program..."); return; end
+	
+	-- breaks block if not matching
+	-- TODO have a separate turtle who scans for nonmatching blocks, picks them up
+	-- and brings them back to return chest
+	local prevslot = turtle.getSelectedSlot();
+	if not turtle.compareDown() then
+		turtle.select(16)
+		turtle.digDown();
+		turtle.drop();
+		turtle.select(prevslot);
+	end
+	
+	turtle.placeDown();
+	status.woolcount = status.woolcount - 1;
+end
+
+function placePixelAtPos(x, z)
+	-- TODO check wool count on a taskwide basis, not every pixel (its slow to change slots this much)
+	-- finds the first item slot with stuff in it
+	local itemfound = false;
+	for i = 1, 15 do
+		if turtle.getItemCount( i ) > 0 then
+			turtle.select( i ); itemfound = true; break;
+		end	
+	end
+	
+	-- NO ITEMS?? go back to depot
+	if not itemfound then
+		
+		print("Not enough wool-- getting wool");
+		goToPos(LANDMARKS[ status.assignedcolor ].x, LANDMARKS[ status.assignedcolor ].z)
+		restockWool();
+	end
+	
+	goToPos(x,z)
+	
+	-- breaks block if not matching
+	-- TODO have a separate turtle who scans for nonmatching blocks, picks them up
+	-- and brings them back to return chest
+	local prevslot = turtle.getSelectedSlot();
+	if not turtle.compareDown() then
+		turtle.select(16)
+		turtle.digDown();
+		turtle.drop();
+		turtle.select(prevslot);
+	end
+	
+	turtle.placeDown();
+end
+
+-- This is a recursive function that calls itself for refueling and returning
+function goToPos(x, z)
+	if not ( x == LANDMARKS.fuel.x and z == LANDMARKS.fuel.z ) then
+		-- If the distance to get to the fuel place + the target square is more than what fuel is left
+		-- then go immediately to get fuel before even trying to go to the target square
+		
+		local targdist = distance(x,z,status.pos.x,status.pos.z);
+		local targtofueldist = distance(LANDMARKS.fuel.x, LANDMARKS.fuel.z,x,z);
+		-- plus 20 extra blocks just in case
+		local cushion  = 20;
+		if targdist + targtofueldist + cushion > turtle.getFuelLevel() then
+			
+			print("Not enough fuel-- getting fuel");
+			goToPos( LANDMARKS.fuel.x, LANDMARKS.fuel.z );
+			refuel();
+		end
+	end
+
+	-- ONLY if z position differs
+	if z ~= status.pos.z then
+		local step;
+		if z > status.pos.z then
+			face(3); step = 1;
+		elseif z < status.pos.z then
+			face(1); step = -1;
+		end
+		local zdiff = math.abs(z - status.pos.z);
+		for i = 1, zdiff do			
+			forward();	status.pos.z = status.pos.z + step;
+		end
+	end
+	
+	-- ONLY if x position differs
+	if x ~= status.pos.x then
+		local step;
+		if x > status.pos.x then
+			face(0); step = 1;
+		elseif x < status.pos.x then
+			face(2); step = -1;
+		end
+		local xdiff = math.abs(x - status.pos.x);
+		for i = 1, xdiff do	
+			forward();	status.pos.x = status.pos.x + step;
+		end
+	end
+end
+
+function goToLandmark( landmarkname )
+	goToPos( LANDMARKS[landmarkname].x, LANDMARKS[landmarkname].z );
+end
+
+function refuel()
+	-- fuel slot is the last slot
+	turtle.select(16)
+	
+	-- we dont want to go over a stack of fuel at a time, otherwise slot 1 will get it too, messing everything up
+	local fuelcount = turtle.getItemCount();
+	while turtle.suckDown(64 - fuelcount) and turtle.getFuelLevel() < turtle.getFuelLimit() do
+		turtle.refuel();
+	end
+end
+
+-- also updates the wool counter
+function restockWool()
+	-- TODO deal with stacks when an item is in there that doesnt stack with it, in case something weird happens
+	
+	status.woolcount = 0;
+	for i = 1, 15 do
+		turtle.select(i)
+		turtle.suckDown(64 - turtle.getItemCount());
+		
+		status.woolcount = status.woolcount + turtle.getItemCount();
+	end
+	print("Restocked. total wool: " .. status.woolcount);
+end
+
+-- updates x/z given facing
+function forwardUpdatePos()
+	if status.facing == 0 then
+		status.pos.x = status.pos.x + 1;
+	elseif status.facing == 1 then
+		status.pos.z = status.pos.z - 1;
+	elseif status.facing == 2 then
+		status.pos.x = status.pos.x - 1;
+	elseif status.facing == 3 then
+		status.pos.z = status.pos.z + 1;
+	end
+end
+
+function forward()
+	if turtle.forward() then
+		forwardUpdatePos(); return true 
+	end
+	-- "if at first you dont succeed, try and try again"
+	while not turtle.forward() do
+		os.sleep(2)
+	end
+	forwardUpdatePos();
+end
+
+function up()
+	if turtle.up() then return true end
+	while not turtle.up() do
+		os.sleep(2)
+	end
+end
+
+function down()
+	if turtle.down() then return true end
+	while not turtle.down() do
+		os.sleep(2)
+	end
+end
+
+function face(targetdir)
+	rightturns = ( status.facing - targetdir ) % 4
+	leftturns  = ( targetdir - status.facing ) % 4
+	
+	if rightturns < leftturns then
+		for i = 1, rightturns do
+			turtle.turnRight()
+		end
+	else
+		for i = 1, leftturns do
+			turtle.turnLeft()
+		end
+	end
+	status.facing = targetdir
+end
+
+-- manhattan distance between two blocks at the same y level
+function distance(x1,z1,x2,z2)
+	return math.abs( x1 - x2 ) + math.abs( z1 - z2 );
+end
+
+main()
